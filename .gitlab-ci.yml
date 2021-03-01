@@ -19,7 +19,7 @@ deploy:
   script:
     - envsubst < cloudflare.tpl > cloudflare.yaml
     # - kubectl create --namespace default deployment cloudflare --image=$CI_REGISTRY_IMAGE:latest
-    - kubectl create --namespace default -f cloudflare.yaml
+    - kubectl apply -f cloudflare.yaml
   environment:
     name: production
     url: https://$CI_ENVIRONMENT_SLUG.$EXTERNAL_URL/
