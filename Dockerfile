@@ -1,10 +1,18 @@
-FROM alpine:latest
+FROM golang:1.19.2-alpine3.16 as go-builder
 
-LABEL maintainer="sinute@outlook.com"
+WORKDIR /cloudflare
 
-ADD cloudflare /bin
-RUN wget -q -O /etc/apk/keys/sgerrand.rsa.pub https://alpine-pkgs.sgerrand.com/sgerrand.rsa.pub && \
-    wget https://github.com/sgerrand/alpine-pkg-glibc/releases/download/2.33-r0/glibc-2.33-r0.apk && \
-    apk add glibc-2.33-r0.apk && \
-    chmod 755 /bin/cloudflare
-ENTRYPOINT ["/bin/cloudflare"]
+COPY . ./
+
+RUN go mod verify
+RUN go build -o bin/cloudflare main.go
+
+FROM alpine:3.16
+
+WORKDIR /cloudflare
+
+LABEL maintainer="Sinute <sinute@outlook.com>"
+
+COPY --from=go-builder /cloudflare/bin/cloudflare ./
+
+ENTRYPOINT [ "/cloudflare/cloudflare" ]
