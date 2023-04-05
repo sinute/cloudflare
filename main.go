@@ -1,118 +1,136 @@
 package main
 
 import (
-	"errors"
+	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/cloudflare/cloudflare-go"
-	"io/ioutil"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
-	"regexp"
 	"strconv"
-	"strings"
 	"time"
+
+	"github.com/cloudflare/cloudflare-go"
+	"golang.org/x/net/context"
 )
+
+type ipInfo struct {
+	IP       string `json:"ip"`
+	City     string `json:"city"`
+	Region   string `json:"region"`
+	Country  string `json:"country"`
+	Loc      string `json:"loc"`
+	Org      string `json:"org"`
+	Timezone string `json:"timezone"`
+	Readme   string `json:"readme"`
+}
 
 func main() {
 	cfAPIKey := flag.String("CF_API_KEY", os.Getenv("CF_API_KEY"), "CF API Key")
 	cfAPIEmail := flag.String("CF_API_EMAIL", os.Getenv("CF_API_EMAIL"), "CF API Email")
 	zoneName := flag.String("CF_ZONE_NAME", os.Getenv("CF_ZONE_NAME"), "CF Zone Name")
 	dnsName := flag.String("CF_DNS_NAME", os.Getenv("CF_DNS_NAME"), "CF DNS Name")
-	sTTL := os.Getenv("CF_DNS_TTL")
-	iTTL := 0
-	err := errors.New("OK")
-	if sTTL != "" {
-		iTTL, err = strconv.Atoi(sTTL)
-		if err != nil {
-			panic(err)
-		}
+	defaultTTL, err := strconv.Atoi(os.Getenv("CF_DNS_TTL"))
+	if err != nil {
+		defaultTTL = 0
 	}
-	ttl := flag.Int("CF_DNS_TTL", iTTL, "CF NDS TTL")
-	flag.Parse()
+	ttl := flag.Int("CF_DNS_TTL", defaultTTL, "CF NDS TTL")
+	defaultIPCheckDuration, err := time.ParseDuration(os.Getenv("IP_CHECK_DURATION"))
+	if err != nil {
+		defaultIPCheckDuration = time.Minute
+	}
+	ipCheckDuration := flag.Duration("IP_CHECK_DURATION", defaultIPCheckDuration, "IP Check Duration")
+	defaultTimeout, err := time.ParseDuration(os.Getenv("CF_TIMEOUT"))
+	if err != nil {
+		defaultTimeout = 30 * time.Second
+	}
+	timeout := flag.Duration("CF_TIMEOUT", defaultTimeout, "IP Check Duration")
 
-	for true {
-		err := DDNS(*cfAPIKey, *cfAPIEmail, *zoneName, *dnsName, *ttl)
-		if err != nil {
-			log.Println(fmt.Sprintf("[FAIL] %s", err.Error()))
-		}
-		time.Sleep(1 * time.Minute)
+	flag.Parse()
+	for {
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+			defer cancel()
+			if err = DDNS(ctx, *cfAPIKey, *cfAPIEmail, *zoneName, *dnsName, *ttl); err != nil {
+				log.Printf("[FAIL] %s\n", err.Error())
+			}
+		}()
+		time.Sleep(*ipCheckDuration)
 	}
 }
 
-func DDNS(cfAPIKey, cfAPIEmail, zoneName, dnsName string, ttl int) (err error) {
-	// Construct a new API object
-	ip, err := getIP()
+func DDNS(ctx context.Context, cfAPIKey, cfAPIEmail, zoneName, dnsName string, ttl int) (err error) {
+	ip, err := getIP(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("getIP fail, err: %w", err)
 	}
+	name := fmt.Sprintf("%s.%s", dnsName, zoneName)
 	api, err := cloudflare.New(cfAPIKey, cfAPIEmail)
 	if err != nil {
-		return err
+		return fmt.Errorf("new Cloudflare API fail, err: %w", err)
 	}
 
-	// Fetch the zone ID
-	id, err := api.ZoneIDByName(zoneName) // Assuming example.com exists in your Cloudflare account already
+	// get zone
+	id, err := api.ZoneIDByName(zoneName)
 	if err != nil {
-		return err
+		return fmt.Errorf("get zoneID fail, err: %w", err)
 	}
+	zoneID := cloudflare.ZoneIdentifier(id)
 
-	// Fetch zone details
-	zone, err := api.ZoneDetails(id)
+	// get dns records
+	dnsRecords, _, err := api.ListDNSRecords(ctx, zoneID, cloudflare.ListDNSRecordsParams{Name: name})
 	if err != nil {
-		return err
+		return fmt.Errorf("list DNS records fail, err: %w", err)
 	}
 
-	domain := strings.Join([]string{dnsName, zoneName}, ".")
-	dnsRecords, err := api.DNSRecords(zone.ID, cloudflare.DNSRecord{
-		Name: domain,
-	})
-	if err != nil {
-		return err
-	}
-
+	proxy := false
+	var dnsRecord cloudflare.DNSRecord
 	if len(dnsRecords) == 0 {
-		dnsRecordResponse, err := api.CreateDNSRecord(zone.ID, cloudflare.DNSRecord{
+		dnsRecord, err = api.CreateDNSRecord(ctx, zoneID, cloudflare.CreateDNSRecordParams{
 			Type:    "A",
-			Name:    domain,
+			Name:    name,
 			Content: ip,
 			TTL:     ttl,
+			Proxied: &proxy,
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("create DNS record fail, err: %w", err)
 		}
-		if !dnsRecordResponse.Success {
-			return errors.New(fmt.Sprintf("Create DNS Record(%s) Fail, rsp(%v)", domain, dnsRecordResponse))
-		}
-		log.Println(fmt.Sprintf("DNS Record Created, %s : %s", domain, ip))
+		log.Printf("DNS Record Created: %+v\n", dnsRecord)
+	} else {
+		dnsRecord = dnsRecords[0]
+	}
+
+	// same dns record, do nothing
+	if dnsRecord.Content == ip {
+		log.Printf("DNS Record Not Change (%s), Skip\n", ip)
 		return nil
 	}
-	if dnsRecords[0].Content == ip {
-		log.Println(fmt.Sprintf("DNS Record Not Change (%s), Skip", ip))
-		return nil
-	}
-	err = api.UpdateDNSRecord(zone.ID, dnsRecords[0].ID, cloudflare.DNSRecord{
+
+	// update dns record
+	_, err = api.UpdateDNSRecord(ctx, zoneID, cloudflare.UpdateDNSRecordParams{
+		ID:      dnsRecord.ID,
 		Type:    "A",
-		Name:    domain,
+		Name:    name,
 		Content: ip,
 		TTL:     ttl,
+		Proxied: &proxy,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("update DNS record fail, err: %w", err)
 	}
-	log.Println(fmt.Sprintf("DNS Record Updated, %s : %s -> %s", domain, dnsRecords[0].Content, ip))
+	log.Printf("update DNS record success, %s : %s -> %s\n", name, dnsRecord.Content, ip)
 	return nil
 }
 
-func getIP() (ip string, err error) {
-	url := "http://myip.ipip.net/"
+func getIP(ctx context.Context) (string, error) {
+	url := "https://ipinfo.io/"
 	method := "GET"
 
-	client := &http.Client{
-		Timeout: 3 * time.Second,
-	}
-	req, err := http.NewRequest(method, url, nil)
+	client := &http.Client{}
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		return "", err
 	}
@@ -122,18 +140,18 @@ func getIP() (ip string, err error) {
 		return "", err
 	}
 	defer res.Body.Close()
-	body, err := ioutil.ReadAll(res.Body)
+
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return "", err
 	}
-	reg, err := regexp.Compile(`^当前 IP：(\d{1,3}(\.\d{1,3}){3})`)
-	if err != nil {
+	info := ipInfo{}
+	if err = json.Unmarshal(body, &info); err != nil {
 		return "", err
 	}
-	find := reg.FindSubmatch(body)
-	if len(find) < 2 {
-		return "", errors.New(fmt.Sprintf("Fail To Get IP, Rsp(%s)", string(body)))
+	if ip := net.ParseIP(info.IP); ip == nil {
+		return "", fmt.Errorf("invalid ip, IPInfo: %+v", info)
 	}
-	log.Println(fmt.Sprintf("Get IP Success, IP(%s)", string(find[1])))
-	return string(find[1]), nil
+	log.Printf("get IPInfo success: %+v\n", info)
+	return info.IP, nil
 }
