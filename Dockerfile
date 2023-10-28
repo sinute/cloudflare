@@ -15,4 +15,6 @@ LABEL maintainer="Sinute <sinute@outlook.com>"
 
 COPY --from=go-builder /cloudflare/bin/cloudflare ./
 
+RUN apk add --no-cache tzdata
+
 ENTRYPOINT [ "/cloudflare/cloudflare" ]
