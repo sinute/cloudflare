@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -10,22 +9,12 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cloudflare/cloudflare-go"
 	"golang.org/x/net/context"
 )
-
-type ipInfo struct {
-	IP       string `json:"ip"`
-	City     string `json:"city"`
-	Region   string `json:"region"`
-	Country  string `json:"country"`
-	Loc      string `json:"loc"`
-	Org      string `json:"org"`
-	Timezone string `json:"timezone"`
-	Readme   string `json:"readme"`
-}
 
 func main() {
 	cfAPIKey := flag.String("CF_API_KEY", os.Getenv("CF_API_KEY"), "CF API Key")
@@ -33,9 +22,6 @@ func main() {
 	zoneName := flag.String("CF_ZONE_NAME", os.Getenv("CF_ZONE_NAME"), "CF Zone Name")
 	dnsName := flag.String("CF_DNS_NAME", os.Getenv("CF_DNS_NAME"), "CF DNS Name")
 	defaultTTL, err := strconv.Atoi(os.Getenv("CF_DNS_TTL"))
-	if err != nil {
-		defaultTTL = 0
-	}
 	ttl := flag.Int("CF_DNS_TTL", defaultTTL, "CF NDS TTL")
 	defaultIPCheckDuration, err := time.ParseDuration(os.Getenv("IP_CHECK_DURATION"))
 	if err != nil {
@@ -126,7 +112,7 @@ func DDNS(ctx context.Context, cfAPIKey, cfAPIEmail, zoneName, dnsName string, t
 }
 
 func getIP(ctx context.Context) (string, error) {
-	url := "https://ipinfo.io/"
+	url := "https://api-ipv4.ip.sb/ip"
 	method := "GET"
 
 	client := &http.Client{}
@@ -141,17 +127,22 @@ func getIP(ctx context.Context) (string, error) {
 	}
 	defer res.Body.Close()
 
-	body, err := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status code: %d", res.StatusCode)
+	}
+
+	// 限制响应体大小，避免异常响应打爆内存
+	body, err := io.ReadAll(io.LimitReader(res.Body, 4096))
 	if err != nil {
 		return "", err
 	}
-	info := ipInfo{}
-	if err = json.Unmarshal(body, &info); err != nil {
-		return "", err
+
+	// 响应形如: 180.172.40.161
+	info := strings.TrimSpace(string(body))
+	ip := net.ParseIP(info)
+	if ip == nil || ip.To4() == nil {
+		return "", fmt.Errorf("invalid ip, IPInfo: %q", info)
 	}
-	if ip := net.ParseIP(info.IP); ip == nil {
-		return "", fmt.Errorf("invalid ip, IPInfo: %+v", info)
-	}
-	log.Printf("get IPInfo success: %+v\n", info)
-	return info.IP, nil
+	log.Printf("get IPInfo success: %s\n", ip.String())
+	return ip.String(), nil
 }
